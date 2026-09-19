@@ -1,0 +1,255 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+
+// --- DEFINIZIONE PIN HARDWARE ---
+#define BTN_UP        13  // Pulsante Su (+0.5°C)
+#define BTN_DOWN      12  // Pulsante Giù (-0.5°C)
+#define BTN_SELECT    14  // Pulsante Conferma / Uscita (Pressione lunga)
+
+#define PIN_FAN       27  // MOSFET Ventola
+#define PIN_RPWM      32  // BTS7960 RPWM (Riscaldamento)
+#define PIN_LPWM      33  // BTS7960 LPWM (Raffreddamento)
+
+#define PIN_NTC_HOT   34  // NTC Lato Caldo
+#define PIN_NTC_SKIN  35  // NTC Pelle
+#define PIN_VBAT      36  // Pin VP (Partitore 47k/10k)
+
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire, -1);
+
+// --- SOGLIE DI SICUREZZA ---
+const float V_BAT_MIN = 9.0;      // Cutoff Tensione Batteria (3S LiPo)
+const float TEMP_HOT_MAX = 65.0;  // Protezione surriscaldamento (°C)
+
+// --- STATI DI NAVIGAZIONE MENU ---
+enum AppState {
+  MAIN_MENU,       // Selezione: Manuale / Automatica
+  MANUAL_MENU,     // Selezione: Raffredda / Riscalda / Indietro
+  MANUAL_COOL,     // Esecuzione manuale raffreddamento
+  MANUAL_HEAT,     // Esecuzione manuale riscaldamento
+  AUTO_MODE        // Controllo automatico con Setpoint
+};
+
+AppState currentState = MAIN_MENU;
+int mainIndex = 0;     // 0: Manuale, 1: Automatica
+int manualIndex = 0;   // 0: Raffredda, 1: Riscalda, 2: Indietro
+
+// --- PARAMETRI AUTOMATICI ---
+float targetTemp = 30.0;     // Soglia di temperatura iniziale (°C)
+const float HYSTERESIS = 0.5; // Finestra di tolleranza termica (°C)
+
+// --- GESTIONE PRESSIONE LUNGA PULSANTE OK ---
+unsigned long btnSelectPressTime = 0;
+bool btnSelectPressed = false;
+
+// --- LETTURA BATTERIA ---
+float readBatteryVoltage() {
+  int raw = analogRead(PIN_VBAT);
+  float vAdc = (raw / 4095.0) * 3.3;
+  return vAdc * 5.7; // Partitore 47k / 10k
+}
+
+// --- LETTURA TEMPERATURA (Beta 3950) ---
+float readTemperature(int pin) {
+  int raw = analogRead(pin);
+  if (raw == 0 || raw == 4095) return 0.0;
+  
+  float v = (raw / 4095.0) * 3.3;
+  float rNtc = 10000.0 * (v / (3.3 - v));
+  float tempK = 1.0 / ((1.0 / 298.15) + (1.0 / 3950.0) * log(rNtc / 10000.0));
+  return tempK - 273.15;
+}
+
+// --- PILOTAGGIO ATTUATORI ---
+void setOutputs(int rpwm, int lpwm, int fanSpeed) {
+  analogWrite(PIN_RPWM, rpwm);
+  analogWrite(PIN_LPWM, lpwm);
+  analogWrite(PIN_FAN, fanSpeed);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Inizializzazione Pulsanti con Pull-Up
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+
+  // Inizializzazione Uscite
+  pinMode(PIN_FAN, OUTPUT);
+  pinMode(PIN_RPWM, OUTPUT);
+  pinMode(PIN_LPWM, OUTPUT);
+  setOutputs(0, 0, 0);
+
+  // Inizializzazione SH1106
+  Wire.begin(21, 22);
+  if (!display.begin(SCREEN_ADDRESS, true)) {
+    for (;;);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(15, 25);
+  display.print("THERMIFLEX SMART");
+  display.setCursor(25, 40);
+  display.print("TUTA WEARABLE");
+  display.display();
+  delay(1500);
+}
+
+void loop() {
+  float vBat = readBatteryVoltage();
+  float tHot = readTemperature(PIN_NTC_HOT);
+  float tSkin = readTemperature(PIN_NTC_SKIN);
+
+  // --- CONTROLLO SICUREZZA ---
+  bool errBat = (vBat < V_BAT_MIN);
+  bool errTemp = (tHot > TEMP_HOT_MAX);
+
+  if (errBat || errTemp) {
+    currentState = MAIN_MENU;
+    setOutputs(0, 0, 0);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("! ARRESTO SICUREZZA !");
+    display.setCursor(0, 20);
+    if (errBat)  display.printf("Bat Crittica: %.1fV", vBat);
+    if (errTemp) display.printf("Temp Elevata: %.1fC", tHot);
+    display.setCursor(0, 45);
+    display.print("Verificare Hardware...");
+    display.display();
+    delay(1000);
+    return;
+  }
+
+  // --- LETTURA ED ELABORAZIONE PULSANTI ---
+  bool upPressed = (digitalRead(BTN_UP) == LOW);
+  bool downPressed = (digitalRead(BTN_DOWN) == LOW);
+  bool selectPressed = (digitalRead(BTN_SELECT) == LOW);
+
+  // --- GESTIONE LOGICA E NAVIGAZIONE ---
+  switch (currentState) {
+
+    case MAIN_MENU:
+      setOutputs(0, 0, 0);
+      if (upPressed) { mainIndex = 0; delay(200); }
+      if (downPressed) { mainIndex = 1; delay(200); }
+      if (selectPressed) {
+        if (mainIndex == 0) currentState = MANUAL_MENU;
+        else if (mainIndex == 1) currentState = AUTO_MODE;
+        delay(250);
+      }
+      break;
+
+    case MANUAL_MENU:
+      setOutputs(0, 0, 0);
+      if (upPressed) { manualIndex = (manualIndex + 2) % 3; delay(200); }
+      if (downPressed) { manualIndex = (manualIndex + 1) % 3; delay(200); }
+      if (selectPressed) {
+        if (manualIndex == 0) currentState = MANUAL_COOL;
+        else if (manualIndex == 1) currentState = MANUAL_HEAT;
+        else if (manualIndex == 2) currentState = MAIN_MENU;
+        delay(250);
+      }
+      break;
+
+    case MANUAL_COOL:
+      setOutputs(0, 200, 255); // Peltier Cooling a 80%, Ventola 100%
+      if (selectPressed) { currentState = MANUAL_MENU; delay(250); }
+      break;
+
+    case MANUAL_HEAT:
+      setOutputs(180, 0, 120); // Peltier Heating a 70%, Ventola 45%
+      if (selectPressed) { currentState = MANUAL_MENU; delay(250); }
+      break;
+
+    case AUTO_MODE:
+      // Modifica Setpoint (+0.5°C / -0.5°C)
+      if (upPressed) { targetTemp += 0.5; if (targetTemp > 42.0) targetTemp = 42.0; delay(180); }
+      if (downPressed) { targetTemp -= 0.5; if (targetTemp < 18.0) targetTemp = 18.0; delay(180); }
+
+      // Gestione Pressione Lunga SELECT (2 Secondi per uscire)
+      if (selectPressed) {
+        if (!btnSelectPressed) {
+          btnSelectPressed = true;
+          btnSelectPressTime = millis();
+        } else if (millis() - btnSelectPressTime >= 2000) {
+          currentState = MAIN_MENU; // Torna al menu principale
+          btnSelectPressed = false;
+          setOutputs(0, 0, 0);
+          delay(300);
+          break;
+        }
+      } else {
+        btnSelectPressed = false;
+      }
+
+      // Algoritmo Automatico di Termoregolazione
+      if (tSkin > (targetTemp + HYSTERESIS)) {
+        setOutputs(0, 220, 255); // Raffredda se la pelle supera la soglia
+      } else if (tSkin < (targetTemp - HYSTERESIS)) {
+        setOutputs(180, 0, 120); // Riscalda se la pelle scende sotto la soglia
+      } else {
+        setOutputs(0, 0, 0);     // In Finestra di Comfort -> Standby
+      }
+      break;
+  }
+
+  // --- AGGIORNAMENTO GRAFICO DISPLAY ---
+  static unsigned long lastDisplay = 0;
+  if (millis() - lastDisplay > 150) {
+    lastDisplay = millis();
+    display.clearDisplay();
+
+    // Barra di Stato Superiore (Sempre Visibile)
+    display.setCursor(0, 0);
+    display.printf("Bat:%.1fV  Dis:%.0fC", vBat, tHot);
+    display.setCursor(0, 11);
+    display.printf("Pelle: %.1fC", tSkin);
+    display.drawLine(0, 21, 128, 21, SH110X_WHITE);
+
+    // Corpo Principale del Menu
+    switch (currentState) {
+      case MAIN_MENU:
+        display.setCursor(0, 26); display.print("SELEZIONA MODALITA:");
+        display.setCursor(10, 39); display.print(mainIndex == 0 ? "> MANUAL" : "  MANUAL");
+        display.setCursor(10, 51); display.print(mainIndex == 1 ? "> AUTOMATICA" : "  AUTOMATICA");
+        break;
+
+      case MANUAL_MENU:
+        display.setCursor(0, 25); display.print("MODALITA MANUALE:");
+        display.setCursor(5, 36); display.print(manualIndex == 0 ? "> RAFFREDDA" : "  RAFFREDDA");
+        display.setCursor(5, 46); display.print(manualIndex == 1 ? "> RISCALDA" : "  RISCALDA");
+        display.setCursor(5, 56); display.print(manualIndex == 2 ? "> INDIETRO" : "  INDIETRO");
+        break;
+
+      case MANUAL_COOL:
+        display.setCursor(20, 32); display.print("MANUALE ATTIVO");
+        display.setCursor(15, 48); display.print("[ RAFFREDDAMENTO ]");
+        break;
+
+      case MANUAL_HEAT:
+        display.setCursor(20, 32); display.print("MANUALE ATTIVO");
+        display.setCursor(25, 48); display.print("[ RISCALDAMENTO ]");
+        break;
+
+      case AUTO_MODE:
+        display.setCursor(0, 25); display.print("SETPOINT AUTOMATICO");
+        display.setTextSize(2);
+        display.setCursor(25, 37);
+        display.printf("%.1f C", targetTemp);
+        display.setTextSize(1);
+        display.setCursor(0, 56);
+        display.print("Tieni OK 2s x Uscire");
+        break;
+    }
+
+    display.display();
+  }
+
+  delay(10);
+}
